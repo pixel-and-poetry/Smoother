@@ -25,14 +25,14 @@ class Rule:
     """文件整理规则。
 
     attributes:
-        extensions:    要匹配的扩展名列表（小写、不含点），如 ["jpg", "png"]
-        destination:   目标文件夹路径（支持 ~ 展开）
-        name_template:  重命名模板，支持 {date}（YYYY-MM-DD）与 {original}（原文件名不含扩展名）
+        extensions:  要匹配的扩展名列表（小写、不含点），如 ["jpg", "png"]
+        destination: 目标文件夹路径（支持 ~ 展开）
+
+    注：命名模板已从规则移出，统一从 config.txt 读取（见 self._name_template）。
     """
 
     extensions: List[str]
     destination: str
-    name_template: str
 
 
 class SmootherApp(rumps.App):
@@ -53,13 +53,20 @@ class SmootherApp(rumps.App):
         self._lock = threading.Lock()
 
         # 整理规则列表：扩展名命中即按对应规则移动 + 重命名
+        # 命名模板不再写在规则里，统一从 config.txt 读取（self._name_template）
         self._rules: List[Rule] = [
             Rule(
                 extensions=["jpg", "png", "pages", "pdf"],
                 destination="~/Downloads/Smoother整理",
-                name_template="{date}_{original}",
             )
         ]
+
+        # 命名模板配置文件：脚本同目录下的 config.txt
+        # 启动时读取一次；文件不存在或为空则回退默认 {date}_{original}
+        self._config_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "config.txt"
+        )
+        self._name_template = self._load_name_template()
 
         # 菜单项
         self.start_item = rumps.MenuItem("开始监控", callback=self.start_monitoring)
@@ -82,6 +89,28 @@ class SmootherApp(rumps.App):
 
         # 初始状态：未监控时禁用“停止监控”
         self.stop_item.set_callback(None)
+
+    # ------------------------------------------------------------------
+    # 配置
+    # ------------------------------------------------------------------
+    def _load_name_template(self) -> str:
+        """从脚本同目录的 config.txt 读取命名模板。
+
+        支持占位符：
+            {date}     当前日期 YYYY-MM-DD
+            {original} 原文件名（不含扩展名）
+            {counter}  重名时自动递增的序号
+        文件不存在或为空时返回默认模板 {date}_{original}。
+        """
+        default = "{date}_{original}"
+        try:
+            if not os.path.isfile(self._config_path):
+                return default
+            with open(self._config_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            return content or default
+        except OSError:
+            return default
 
     # ------------------------------------------------------------------
     # 轮询逻辑
@@ -160,21 +189,38 @@ class SmootherApp(rumps.App):
             print(f"[Smoother] 创建目标目录失败: {dest_dir} ({e})", flush=True)
             return
 
-        # 按模板生成新文件名
+        # 按配置模板生成新文件名（支持 {date} / {original} / {counter}）
         date_str = time.strftime("%Y-%m-%d")
-        new_name = matched_rule.name_template.format(date=date_str, original=original)
+        template = self._name_template
+        has_counter = "{counter}" in template
+
+        counter = 1
+        new_name = template.format(date=date_str, original=original, counter=counter)
         # 模板若未显式包含扩展名，则补上原扩展名（保留大小写）
         if not os.path.splitext(new_name)[1]:
             new_name = new_name + ext_with_dot
-
-        # 处理目标重名：追加 _1 / _2 ... 后缀
         dest_path = os.path.join(dest_dir, new_name)
+
+        # 处理目标重名：
+        # - 模板含 {counter}：递增 counter 并重新渲染，直到不重名
+        # - 模板不含 {counter}：追加 _N 后缀（保留原行为）
         if os.path.exists(dest_path):
-            name_part, ext_part = os.path.splitext(new_name)
-            counter = 1
-            while os.path.exists(dest_path):
-                dest_path = os.path.join(dest_dir, f"{name_part}_{counter}{ext_part}")
-                counter += 1
+            if has_counter:
+                while os.path.exists(dest_path):
+                    counter += 1
+                    new_name = template.format(
+                        date=date_str, original=original, counter=counter
+                    )
+                    if not os.path.splitext(new_name)[1]:
+                        new_name = new_name + ext_with_dot
+                    dest_path = os.path.join(dest_dir, new_name)
+            else:
+                name_part, ext_part = os.path.splitext(new_name)
+                while os.path.exists(dest_path):
+                    dest_path = os.path.join(
+                        dest_dir, f"{name_part}_{counter}{ext_part}"
+                    )
+                    counter += 1
 
         # 移动（同卷为 rename，跨卷自动 copy+delete）
         try:
