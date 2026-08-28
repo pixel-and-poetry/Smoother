@@ -8,6 +8,7 @@ Smoother - macOS 菜单栏应用
     pip install rumps
 """
 
+import csv
 import os
 import shutil
 import threading
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 from typing import List
 
 import rumps
+from AppKit import NSApp, NSImage, NSOKButton, NSOpenPanel, NSWorkspace
 
 
 @dataclass
@@ -62,10 +64,21 @@ class SmootherApp(rumps.App):
         # 菜单项
         self.start_item = rumps.MenuItem("开始监控", callback=self.start_monitoring)
         self.stop_item = rumps.MenuItem("停止监控", callback=self.stop_monitoring)
+        self.set_icon_item = rumps.MenuItem(
+            "设置文件夹图标", callback=self.set_folder_icon
+        )
         self.quit_item = rumps.MenuItem("退出", callback=self.quit_app)
 
         # 组装菜单（None 作为分隔符）
-        self.menu = [self.start_item, self.stop_item, None, self.quit_item]
+        # 结构：开始监控 / 停止监控  ||  设置文件夹图标  ||  退出
+        self.menu = [
+            self.start_item,
+            self.stop_item,
+            None,
+            self.set_icon_item,
+            None,
+            self.quit_item,
+        ]
 
         # 初始状态：未监控时禁用“停止监控”
         self.stop_item.set_callback(None)
@@ -167,8 +180,35 @@ class SmootherApp(rumps.App):
         try:
             shutil.move(src_path, dest_path)
             print(f"[Smoother] 已整理: {dest_path}", flush=True)
+            # 移动成功后追加一条整理记录到目标文件夹下的 整理日志.csv
+            self._append_log(dest_dir, src_path, dest_path)
         except OSError as e:
             print(f"[Smoother] 移动失败: {src_path} ({e})", flush=True)
+
+    def _append_log(self, dest_dir: str, src_path: str, dest_path: str):
+        """把本次整理记录追加到目标文件夹下的 整理日志.csv。
+
+        列：原文件名、新文件名、目标文件夹、整理时间（YYYY-MM-DD HH:MM:SS）。
+        文件不存在（或为空）则自动创建并写入表头。
+        使用标准库 csv，按 utf-8-sig 编码写入，便于 Excel 正确显示中文。
+        """
+        log_path = os.path.join(dest_dir, "整理日志.csv")
+        # 文件不存在或为空 → 需要先写表头
+        need_header = (not os.path.exists(log_path)) or os.path.getsize(log_path) == 0
+        row = [
+            os.path.basename(src_path),  # 原文件名（含扩展名）
+            os.path.basename(dest_path),  # 新文件名（含扩展名）
+            dest_dir,  # 目标文件夹
+            time.strftime("%Y-%m-%d %H:%M:%S"),  # 整理时间
+        ]
+        try:
+            with open(log_path, "a", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                if need_header:
+                    writer.writerow(["原文件名", "新文件名", "目标文件夹", "整理时间"])
+                writer.writerow(row)
+        except OSError as e:
+            print(f"[Smoother] 写入日志失败: {log_path} ({e})", flush=True)
 
     def _poll_loop(self):
         """轮询线程主循环：每 3 秒扫描一次，直到收到停止信号。"""
@@ -237,6 +277,68 @@ class SmootherApp(rumps.App):
                 self._thread.join(timeout=5)
                 self._thread = None
         rumps.quit_application()
+
+    # ------------------------------------------------------------------
+    # 设置文件夹图标
+    # ------------------------------------------------------------------
+    def set_folder_icon(self, _sender):
+        """点击“设置文件夹图标”：先选目标文件夹，再选图片，把图片设为文件夹图标。
+
+        流程：
+        1. NSOpenPanel（仅文件夹）→ 选目标文件夹。
+        2. NSOpenPanel（仅 png/jpg/jpeg）→ 选图标图片。
+        3. NSImage 加载图片，NSWorkspace.setIcon:forFile:options: 写入图标。
+        成功发送“图标已应用”通知，失败打印错误。
+        """
+        # 菜单栏应用默认是后台应用，先激活自身，否则面板可能不显示在前台
+        NSApp.activateIgnoringOtherApps_(True)
+
+        # 1) 选择目标文件夹（只允许选择文件夹，不允许选文件）
+        folder_panel = NSOpenPanel.openPanel()
+        folder_panel.setTitle_("选择要设置图标的目标文件夹")
+        folder_panel.setCanChooseFiles_(False)
+        folder_panel.setCanChooseDirectories_(True)
+        folder_panel.setAllowsMultipleSelection_(False)
+        folder_panel.setCanCreateDirectories_(False)
+        if folder_panel.runModal() != NSOKButton:
+            return  # 用户取消
+        folder_path = folder_panel.URLs()[0].path()
+
+        # 2) 选择图片（限定 png / jpg / jpeg）
+        image_panel = NSOpenPanel.openPanel()
+        image_panel.setTitle_("选择作为图标的图片（png / jpg / jpeg）")
+        image_panel.setCanChooseFiles_(True)
+        image_panel.setCanChooseDirectories_(False)
+        image_panel.setAllowsMultipleSelection_(False)
+        image_panel.setAllowedFileTypes_(["png", "jpg", "jpeg"])
+        if image_panel.runModal() != NSOKButton:
+            return  # 用户取消
+        image_path = image_panel.URLs()[0].path()
+
+        # 3) 加载图片为 NSImage，再调用 NSWorkspace 写入文件夹图标
+        image = NSImage.alloc().initWithContentsOfFile_(image_path)
+        if image is None:
+            print(
+                f"[Smoother] 图标设置失败: 无法加载图片 {image_path}",
+                flush=True,
+            )
+            rumps.notification("Smoother", "图标设置失败", "无法加载所选图片")
+            return
+
+        # setIcon:forFile:options:  返回 BOOL 表示是否设置成功；options 传 0 表示无附加选项
+        ok = NSWorkspace.sharedWorkspace().setIcon_forFile_options_(
+            image, folder_path, 0
+        )
+        if ok:
+            rumps.notification(
+                "Smoother",
+                "图标已应用",
+                f"已为 {os.path.basename(folder_path)} 设置图标",
+            )
+            print(f"[Smoother] 图标已应用: {folder_path}", flush=True)
+        else:
+            print(f"[Smoother] 图标设置失败: {folder_path}", flush=True)
+            rumps.notification("Smoother", "图标设置失败", "设置图标时出错")
 
 
 if __name__ == "__main__":
