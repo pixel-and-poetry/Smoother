@@ -17,7 +17,13 @@ from dataclasses import dataclass
 from typing import List
 
 import rumps
-from AppKit import NSApp, NSImage, NSOKButton, NSOpenPanel, NSWorkspace
+from AppKit import (
+    NSApp,
+    NSImage,
+    NSOKButton,
+    NSOpenPanel,
+    NSWorkspace,
+)
 
 
 @dataclass
@@ -71,16 +77,21 @@ class SmootherApp(rumps.App):
         # 菜单项
         self.start_item = rumps.MenuItem("开始监控", callback=self.start_monitoring)
         self.stop_item = rumps.MenuItem("停止监控", callback=self.stop_monitoring)
+        self.sort_item = rumps.MenuItem(
+            "整理到指定文件夹", callback=self.sort_to_folder
+        )
         self.set_icon_item = rumps.MenuItem(
             "设置文件夹图标", callback=self.set_folder_icon
         )
         self.quit_item = rumps.MenuItem("退出", callback=self.quit_app)
 
         # 组装菜单（None 作为分隔符）
-        # 结构：开始监控 / 停止监控  ||  设置文件夹图标  ||  退出
+        # 结构：开始监控 / 停止监控  ||  整理到指定文件夹  ||  设置文件夹图标  ||  退出
         self.menu = [
             self.start_item,
             self.stop_item,
+            None,
+            self.sort_item,
             None,
             self.set_icon_item,
             None,
@@ -314,6 +325,108 @@ class SmootherApp(rumps.App):
             self.stop_item.set_callback(None)
 
             rumps.notification("Smoother", "监控已停止", "已停止监控下载文件夹")
+
+    # ------------------------------------------------------------------
+    # 整理到指定文件夹（一次性批量移动）
+    # ------------------------------------------------------------------
+    def sort_to_folder(self, _sender):
+        """点击“整理到指定文件夹”：先选时间范围，再选目标文件夹，把 ~/Downloads 根目录符合时间范围的文件移动过去。
+
+        流程：
+        1. rumps.alert 选择时间范围（最近24/48小时，取消则直接返回）。
+        2. NSOpenPanel（仅文件夹）→ 选目标文件夹；取消则直接返回。
+        3. 扫描 ~/Downloads 根目录所有文件（不含子文件夹）。
+        4. 只处理修改时间在 threshold 内的文件；逐个移动，保留原文件名；
+           目标重名追加 _1/_2…（保留扩展名）。
+        5. 目标文件夹不存在自动创建。
+        6. 每个文件移动成功后追加 整理日志.csv 一条记录（复用 _append_log）。
+        7. 完成后发通知“整理完成”并打印汇总。
+        """
+        # 菜单栏应用默认是后台应用，先激活自身，否则面板可能不显示在前台
+        NSApp.activateIgnoringOtherApps_(True)
+
+        # 1) 选择要整理的文件时间范围
+        click = rumps.alert(
+            message="选择要整理的文件时间范围",
+            title="Smoother",
+            ok="最近24小时",
+            other="最近48小时",
+            cancel="取消",
+        )
+        # rumps.alert 实际返回按钮序号：
+        #   ok（“最近24小时”）= 1，other（“最近48小时”）= -1，
+        #   取消 / 关闭窗口 / 按 Esc 等返回其它值（如 0）。
+        if click == 1:
+            threshold = 24 * 3600
+        elif click == -1:
+            threshold = 48 * 3600
+        else:
+            return  # 取消或未选择
+
+        # 2) 选择目标文件夹（只允许文件夹，不允许选文件）
+        panel = NSOpenPanel.openPanel()
+        panel.setTitle_("选择整理到的目标文件夹")
+        panel.setCanChooseFiles_(False)
+        panel.setCanChooseDirectories_(True)
+        panel.setAllowsMultipleSelection_(False)
+        panel.setCanCreateDirectories_(True)
+        if panel.runModal() != NSOKButton:
+            return  # 用户取消
+        dest_dir = panel.URLs()[0].path()
+
+        # 目标文件夹不存在则创建
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+        except OSError as e:
+            rumps.notification("Smoother", "错误", f"无法创建目标文件夹: {e}")
+            return
+
+        # 3) 扫描 ~/Downloads 根目录文件（仅文件，不含子文件夹）
+        try:
+            entries = []
+            with os.scandir(self.download_path) as it:
+                for entry in it:
+                    if entry.is_file():
+                        entries.append(entry.path)
+        except FileNotFoundError:
+            rumps.notification(
+                "Smoother", "错误", f"下载目录不存在: {self.download_path}"
+            )
+            return
+
+        # 4) 逐个移动，只处理修改时间在 threshold 内的文件；保留原文件名；目标重名追加 _1/_2…（保留扩展名）
+        moved = 0
+        now = time.time()
+        for src_path in sorted(entries):
+            # 源文件可能在循环过程中被改动/删除
+            if not os.path.isfile(src_path):
+                continue
+            # 超出时间范围 → 跳过，不移动
+            if now - os.path.getmtime(src_path) > threshold:
+                continue
+            original = os.path.basename(src_path)
+            dest_path = os.path.join(dest_dir, original)
+            if os.path.exists(dest_path):
+                name_part, ext_part = os.path.splitext(original)
+                counter = 1
+                while os.path.exists(dest_path):
+                    dest_path = os.path.join(
+                        dest_dir, f"{name_part}_{counter}{ext_part}"
+                    )
+                    counter += 1
+            try:
+                shutil.move(src_path, dest_path)
+                moved += 1
+                # 5) 追加整理记录（CSV 不存在或为空时 _append_log 自动写表头）
+                self._append_log(dest_dir, src_path, dest_path)
+            except OSError as e:
+                print(f"[Smoother] 移动失败: {src_path} ({e})", flush=True)
+
+        # 6) 汇总
+        print(f"[Smoother] 整理完成，共移动 {moved} 个文件", flush=True)
+        rumps.notification(
+            "Smoother", "整理完成", f"共移动 {moved} 个文件"
+        )
 
     def quit_app(self, _sender):
         """退出应用前清理轮询线程资源。"""
